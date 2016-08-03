@@ -4,9 +4,9 @@ def read():
   parser = argparse.ArgumentParser()
   parser.add_argument("--max_episodes", type=int, default=20000,
                       help="Max number of times a game is run to learn")
-  parser.add_argument("--max_epochs", type=int, default=300,
+  parser.add_argument("--max_epochs", type=int, default=500,
                       help="Max number of epochs per game")
-  parser.add_argument("--discrete_buckets", type=int, default=10,
+  parser.add_argument("--discrete_buckets", type=int, default=4,
                       help="Buckets used to discretise the action space per dimension")
   parser.add_argument("--action_min", type=int, default=-1,
                       help="Minimum for action")
@@ -14,9 +14,9 @@ def read():
                       help="Maximum for action")
   parser.add_argument("--batch_size", type=int, default=10,
                       help="Size of batch taken from experience")
-  parser.add_argument("--experience_memory", type=int, default=500,
+  parser.add_argument("--experience_memory", type=int, default=1000,
                       help="Memory of the experience")
-  parser.add_argument("--gamma_parameter", type=float, default=0.8,
+  parser.add_argument("--gamma_parameter", type=float, default=0.6,
                       help="Gamma in the learning algorithm")
   parser.add_argument("--exploration_probability", type=float, default=0.1,
                       help="Probability of random action")

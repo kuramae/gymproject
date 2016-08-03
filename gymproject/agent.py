@@ -67,217 +67,197 @@ class ContinuousAgent:
     self.agent.training_step()
 
 
-
+# The training is made of experiences of the type (observation, action, reward, newobservation)
+# reward is r, observation is s and new observation is s', action is a
+# Q(s, a) = r + gamma * max_a'(Q(s', a'))
+# Q(s, a) is partially obseved, so r, a, s' and s all come from the exerpience
+# but we use the network to get max_a'(Q(s', a')).
+# We get max_a'(Q(s', a')) and then we use r + gamma * max_a'(Q(s', a')) as
+# y of the network (expected value). The loss that we give as input is is y - Q(s, a).
 class Agent:
   def __init__(self, options, state_dimensions, action_dimensions):
-    self.action_dimensions = action_dimensions
+    self.num_possible_actions = action_dimensions
     self.state_dimensions = state_dimensions
-    self.options = options
     # TODO derive this based on the number of actions
     self.exploration_probability = options.exploration_probability
     self.batch_size = options.batch_size
     self.gamma_parameter = options.gamma_parameter
     self.experience_memory = options.experience_memory
-    self.experience = []
-    self.optimizer = tf.train.AdamOptimizer(learning_rate=0.01)
+
 
   def initialize(self):
     self.training_steps = 0
-    self.session = tf.Session()
-    self.network = self.build_inner_network()
-    self.define_placeholders()
-    self.define_variables(self.network)
-    self.train_writer = tf.train.SummaryWriter('/tmp/train',
-                                          self.session.graph)
-    self.merged = tf.merge_all_summaries()
-    self.session.run(tf.initialize_all_variables())
+    self._experience = []
+    self._session = tf.Session()
+    self._network = self.build_inner_network()
+    self._network_input = self._network.get_input()
+    self._network_output = self._network.get_output()
+    self._target = tf.placeholder("float", [None])
+    # It picks the action network output is a (batch X action_dimensions) matrix and self.action is
+    # a (action_dimensions x action_dimensions) matrix where each row is a [0 ... 1 ... 0] type vector
+    # By multiplying (element-wise) we get a (batch x action_dimension) and by summing we get a vector with all the
+    # rewards for each element of the batch
+    self._picked_action_vector = tf.placeholder("float", [self.batch_size, self.num_possible_actions], name="picked_action_vector")
+    q_of_current_state = tf.reduce_sum(tf.mul(self._network_output, self._picked_action_vector, name="q_of_current_state"), reduction_indices=1)
+    self._cost = tf.reduce_mean(tf.square(self._target - q_of_current_state), name="cost")
+    self._train_operation = tf.train.AdamOptimizer(1e-2).minimize(self._cost)
+    self._define_histograms()
+    self._train_writer = tf.train.SummaryWriter('/tmp/train', self._session.graph)
+    self._merged = tf.merge_all_summaries()
+    self._session.run(tf.initialize_all_variables())
 
   def store(self, observation, action, reward, newobservation):
-    if len(self.experience) > self.experience_memory:
-      self.experience.pop(0)
-    self.experience.append((observation, action, reward, newobservation))
+    if len(self._experience) > self.experience_memory:
+      self._experience.pop(0)
+    self._experience.append((observation, int(action), reward, newobservation))
 
+  def _action_index_to_vector(self, index):
+    vector = [0] * self.num_possible_actions
+    # TODO ew
+    vector[index.tolist()[0]] = 1
+    return vector
 
-  def define_placeholders(self):
-    """This is what comes in the network
-    """
-    # Given a current state, we find the best action to perform
-    # The None part means it's variable (it will be part of the batch)
-    # So the current state will be a matrix of the type
-    # a b c d
-    # e f g h
-    # i j k l
-    # (if the batch has size 3 and the state has size 4)
-    self.observation = tf.placeholder("float", [None, self.state_dimensions], name="observation")
-    self.next_observation = tf.placeholder(tf.float32, self.state_batch_shape(), name="next_observation")
-    # TODO: why stop gradient?
-    # self.next_action_scores = tf.stop_gradient(self.network(self.next_observation))
-    self.next_action_scores = tf.stop_gradient(self.network(self.next_observation))
-    self.rewards = tf.placeholder(tf.float32, (None,), name="rewards")
-    tf.histogram_summary("rewards", self.rewards)
-    # Could set batch_size rather than None but this leaves it more flexible
-    self.next_observation_mask = tf.placeholder(tf.float32, (None,), name="next_observation_mask")
-    self.action_mask = tf.placeholder(tf.float32, (None, self.action_dimensions), name="action_mask")
-
-  def define_variables(self, network):
-    # These are used to go from an observation to an action
-    with tf.name_scope("action"):
-      # Puts the observation in, and it gets the scores out
-      self.action_scores = tf.identity(network(self.observation), name="action_scores")
-      tf.histogram_summary("action_scores", self.action_scores)
-      # Returns the index of the action with the highest action_score
-      self.predicted_actions = tf.argmax(self.action_scores, dimension=1, name="predicted_actions")
-      tf.histogram_summary("predicted_actions", self.predicted_actions)
-
-    # This is to predict future rewards based on a batch of experiences (it's what we sum to the reward)
-    with tf.name_scope("estimating_future_rewards"):
-      max_next_actions = tf.reduce_max(self.next_action_scores, reduction_indices=[1, ]) * self.next_observation_mask
-      # There's a reward and an action for each action
-      self.future_rewards = self.rewards + self.gamma_parameter * max_next_actions
-      tf.histogram_summary("future_rewards", self.future_rewards)
-
-    # This is to get the full q-value
-    with tf.name_scope("q_value"):
-      self.masked_action_scores = tf.reduce_sum(self.action_scores * self.action_mask, reduction_indices=[1, ])
-      tf.histogram_summary("masked_action_scores", self.masked_action_scores)
-      temp_diff = self.masked_action_scores - self.future_rewards
-      self.prediction_error = tf.reduce_mean(tf.square(temp_diff))
-      tf.histogram_summary("prediction_error", self.prediction_error)
-      gradients = self.optimizer.compute_gradients(self.prediction_error)
-      for i, (grad, var) in enumerate(gradients):
-        if grad is not None:
-          gradients[i] = (tf.clip_by_norm(grad, 5), var)
-      # Add histograms for gradients.
-      # for grad, var in gradients:
-      #   tf.histogram_summary(var.name, var)
-      #   if grad is not None:
-      #     tf.histogram_summary(var.name + '/gradients', grad)
-      self.train_op = self.optimizer.apply_gradients(gradients)
+  def _define_histograms(self):
+    tf.histogram_summary("cost", self._cost)
 
   def build_inner_network(self):
     # First layer input: states, output: 200 (input layer)
     # Second layer input: 200, output: 200 (hidden layer 0)
     # Second layer input: 200, output: num_actions (hidden layer 2)
-    return MLP([self.state_dimensions, ], [HIDDEN_NEURONS, HIDDEN_NEURONS, self.action_dimensions],
-               [tf.tanh, tf.tanh, tf.identity])
+    return MLP(self.state_dimensions, self.num_possible_actions)
 
   def state_batch_shape(self):
     return (self.batch_size, self.state_dimensions)
+
+  def action_batch_shape(self):
+    return (self.batch_size, self.num_possible_actions)
 
   def training_step(self):
     """Pick a self.minibatch_size exeperiences from reply buffer
     and backpropage the value function.
     """
-    if len(self.experience) < self.batch_size:
+    if len(self._experience) < self.batch_size:
       return
 
     # sample experience.
-    samples = random.sample(self.experience, self.batch_size)
+    samples = random.sample(self._experience, self.batch_size)
 
     # bach states
     # if we have 2 state dimensions and a batch of five we have a 5x2 matrix [[a,b], [c,d], ...]
     states = np.empty(self.state_batch_shape())
     new_states = np.empty(self.state_batch_shape())
-    action_mask = np.zeros((self.batch_size, self.action_dimensions))
-    new_states_mask = np.empty((self.batch_size,))
+    actions = np.empty((self.batch_size, 1), dtype=int)
     # One reward for each batch element (and for each action)
     rewards = np.empty((self.batch_size,))
 
     for i, (state, action, reward, newstate) in enumerate(samples):
       states[i] = state
-      action_mask[i] = 0
-      action_mask[i][action] = 1
       rewards[i] = reward
-      if newstate is not None:
-        new_states[i] = newstate
-        new_states_mask[i] = 1
-      else:
-        new_states[i] = 0
-        new_states_mask[i] = 0
+      new_states[i] = newstate
+      # this is just the index of the Q function
+      actions[i] = action
 
-    summary = self.session.run([
-      self.merged
-    ], {
-      self.observation: states,
-      self.next_observation: new_states,
-      self.next_observation_mask: new_states_mask,
-      self.action_mask: action_mask,
-      self.rewards: rewards
-    })
-    self.train_writer.add_summary(summary[0], self.training_steps)
+    # Gets the q function value for each action (1xaction_dimension) vector
+    q_function_per_action = self._network_output.eval(session=self._session, feed_dict={self._network_input: self.matrix_to_tensor(new_states)})
+    expected_q = []
+    for i in range(len(samples)):
+      expected_q.append(
+          rewards[i] + self.gamma_parameter * np.max(q_function_per_action[i]))
+
+    state_tensor = self.matrix_to_tensor(states)
+    action_tensor = [self._action_index_to_vector(a) for a in actions]
+    summary = self._train_operation.run(
+      session=self._session,
+      feed_dict={
+      self._network_input: state_tensor,
+      self._picked_action_vector: action_tensor,
+      self._target: expected_q})
+
+
+    #self.train_writer.add_summary(summary[0], self.training_steps)
     self.training_steps += 1
 
   def run_action(self, observation):
     """Given observation returns the action that should be chosen using
     DeepQ learning strategy. Does not backprop."""
-    assert len(observation) == self.state_dimensions, "dimensions differ %s != %s" % (len(observation) , self.state_dimensions)
+    assert len(observation) == self.state_dimensions, "dimensions differ %s != %s" % \
+                                                      (len(observation), self.state_dimensions)
     if random.random() < self.exploration_probability:
-      return random.randint(0, self.action_dimensions - 1)
+      return_action_index = random.randint(0, self.num_possible_actions - 1)
     else:
-      logger.debug("Running with observation %s", observation)
-      # [observation] is like [[a,b,c]]
-      return self.session.run(self.predicted_actions, {self.observation: [observation]})[0]
+      q_function_per_action = self._session.run(self._network_output, feed_dict={self._network_input: self.vector_to_tensor(observation)})[0]
+      action_index = np.argmax(q_function_per_action)
+      return_action_index = action_index
+    assert return_action_index < self.num_possible_actions and return_action_index >= 0, "action index outside boundary %s" % \
+                                                                                         (return_action_index)
+    return return_action_index
+
+  # from (X, Y) to (X, 1, Y, 1)
+  def matrix_to_tensor(self, matrix):
+    batch_rows = []
+    for b in matrix:
+      batch_rows.append([[[i] for i in b]])
+    return batch_rows
+
+  # from (X) to (1, 1, Y, 1)
+  def vector_to_tensor(self, vector):
+    return [[[[i] for i in vector]]]
+
 
 
 class MLP(object):
-  def __init__(self, input_sizes, hiddens, nonlinearities):
-    self.input_sizes = input_sizes
-    self.hiddens = hiddens
-    self.input_nonlinearity, self.layer_nonlinearities = nonlinearities[0], nonlinearities[1:]
+  def __init__(self, input_size, output_size):
     self.scope = "brain"
 
-    assert len(hiddens) == len(nonlinearities), \
-      "Number of hiddens must be equal to number of nonlinearities"
-
     with tf.variable_scope(self.scope):
-      self.input_layer = Layer(input_sizes, hiddens[0], scope="input_layer")
-      self.layers = []
-      for l_idx, (h_from, h_to) in enumerate(zip(hiddens[:-1], hiddens[1:])):
-        self.layers.append(Layer(h_from, h_to, scope="hidden_layer_%d" % (l_idx,)))
+      # We keep height to 1
+      HEIGHT = 1
+      # Batch dimension is flexible
+      BATCH_DIMENSION = None
+      INPUT_LAYER_DEPTH = 1
+      PADDING = "SAME"
+      input_layer = tf.placeholder("float", [BATCH_DIMENSION, HEIGHT, input_size, INPUT_LAYER_DEPTH])
 
-  def __call__(self, xs):
-    if type(xs) != list:
-      xs = [xs]
-    with tf.variable_scope(self.scope):
-      hidden = self.input_nonlinearity(self.input_layer(xs))
-      for layer, nonlinearity in zip(self.layers, self.layer_nonlinearities):
-        hidden = nonlinearity(layer(hidden))
-      return hidden
+      # First Layer
+      convolution_weights_1 = tf.Variable(tf.truncated_normal([HEIGHT, 4, 1, 32], stddev=0.01))
+      convolution_bias_1 = tf.Variable(tf.constant(0.01, shape=[32]))
+      hidden_convolutional_layer_1 = tf.nn.relu(
+        tf.nn.conv2d(input_layer, convolution_weights_1, strides=[HEIGHT, 2, 1, 1], padding=PADDING) + convolution_bias_1)
 
-  def variables(self):
-    res = self.input_layer.variables()
-    for layer in self.layers:
-      res.extend(layer.variables())
-    return res
+      # Second Layer
+      convolution_weights_2 = tf.Variable(tf.truncated_normal([HEIGHT, 4, 32, 64], stddev=0.01))
+      convolution_bias_2 = tf.Variable(tf.constant(0.01, shape=[64]))
+      hidden_convolutional_layer_2 = tf.nn.relu(
+        tf.nn.conv2d(hidden_convolutional_layer_1, convolution_weights_2, strides=[1, 2, 1, 1],
+                     padding=PADDING) + convolution_bias_2)
 
+      # Third layer
+      convolution_weights_3 = tf.Variable(tf.truncated_normal([HEIGHT, 4, 64, 64], stddev=0.01))
+      convolution_bias_3 = tf.Variable(tf.constant(0.01, shape=[64]))
+      hidden_convolutional_layer_3 = tf.nn.relu(
+        tf.nn.conv2d(hidden_convolutional_layer_2, convolution_weights_3,
+                     strides=[1, 2, 1, 1], padding=PADDING) + convolution_bias_3)
+      # TODO works only for 24 states
+      magic_number = 6
+      hidden_convolutional_layer_3_flat = tf.reshape(hidden_convolutional_layer_3, [-1, 256 * magic_number])
 
-class Layer(object):
-  def __init__(self, input_sizes, output_size, scope):
-    """Cretes a neural network layer."""
-    if type(input_sizes) != list:
-      input_sizes = [input_sizes]
+      # Fourth Layer
+      feed_forward_weights_1 = tf.Variable(tf.truncated_normal([256 * magic_number, 256], stddev=0.01))
+      feed_forward_bias_1 = tf.Variable(tf.constant(0.01, shape=[256]))
+      final_hidden_activations = tf.nn.relu(
+        tf.matmul(hidden_convolutional_layer_3_flat, feed_forward_weights_1) + feed_forward_bias_1)
 
-    self.input_sizes = input_sizes
-    self.output_size = output_size
-    self.scope = scope or "Layer"
+      # Output Layer
+      feed_forward_weights_2 = tf.Variable(tf.truncated_normal([256, output_size], stddev=0.01))
+      feed_forward_bias_2 = tf.Variable(tf.constant(0.01, shape=[output_size]))
+      output_layer = tf.matmul(final_hidden_activations, feed_forward_weights_2) + feed_forward_bias_2
 
-    with tf.variable_scope(self.scope):
-      self.Ws = []
-      for input_idx, input_size in enumerate(input_sizes):
-        W_name = "W_%d" % (input_idx,)
-        W_initializer = tf.random_uniform_initializer(
-          -1.0 / math.sqrt(input_size), 1.0 / math.sqrt(input_size))
-        W_var = tf.get_variable(W_name, (input_size, output_size), initializer=W_initializer)
-        self.Ws.append(W_var)
-      self.b = tf.get_variable("b", (output_size,), initializer=tf.constant_initializer(0))
+      self.input_layer = input_layer
+      # learn that these actions in these states lead to this reward
+      self.output_layer = output_layer
 
-  def __call__(self, xs):
-    if type(xs) != list:
-      xs = [xs]
-    assert len(xs) == len(self.Ws), \
-      "Expected %d input vectors, got %d" % (len(self.Ws), len(xs))
-    with tf.variable_scope(self.scope):
-      return sum([tf.matmul(x, W) for x, W in zip(xs, self.Ws)]) + self.b
+  def get_input(self):
+    return self.input_layer
 
-  def variables(self):
-    return [self.b] + self.Ws
+  def get_output(self):
+    return self.output_layer

@@ -52,7 +52,7 @@ def run_training(agent, env, options):
       agent.train()
       # Update state
       state = new_state
-      if reward > 0:
+      if reward > 0.5:
         logger.debug("Reward: %s", reward)
       if done:
         logger.debug("Episode finished after {} timesteps".format(t + 1))
